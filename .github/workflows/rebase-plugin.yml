@@ -273,7 +273,7 @@ EOF
             --body-file /tmp/pr_body.md
 
       - name: Handle Failure
-        if: steps.rebase.outputs.status == 'failed'
+        if: steps.rebase.outputs.status == 'failed' && steps.ai_resolve.outputs.status != 'success'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
