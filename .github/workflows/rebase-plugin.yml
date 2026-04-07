@@ -94,6 +94,82 @@ jobs:
 
           echo "merge_base=$MERGE_BASE" >> $GITHUB_OUTPUT
 
+      - name: AI Re-implementation
+        id: ai_resolve
+        if: steps.rebase.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          UPSTREAM_BR: ${{ steps.setup.outputs.upstream_branch }}
+        run: |
+          # Build the prompt with fork diff and upstream file contents
+          FORK_DIFF=$(cat /tmp/fork.diff)
+          UPSTREAM_CONTENT=""
+          while IFS= read -r file; do
+            if [ -f "/tmp/upstream_files/$file" ]; then
+              CONTENT=$(cat "/tmp/upstream_files/$file")
+              UPSTREAM_CONTENT="${UPSTREAM_CONTENT}
+          --- FILE: ${file} ---
+          ${CONTENT}
+          --- END FILE ---
+          "
+            fi
+          done < /tmp/affected_files.txt
+
+          PROMPT="You are re-implementing changes from a forked repository onto the current upstream code.
+
+          Here are the changes the fork made (as a unified diff):
+          \`\`\`diff
+          ${FORK_DIFF}
+          \`\`\`
+
+          Here are the current upstream versions of the affected files:
+          ${UPSTREAM_CONTENT}
+
+          Re-implement the fork's changes on top of the current upstream code. Preserve the intent of every change in the diff.
+
+          Output ONLY the modified files in this exact format (no other text):
+
+          --- FILE: path/to/file ---
+          <full file content here>
+          --- END FILE ---"
+
+          # Build JSON payload using jq
+          PAYLOAD=$(jq -n \
+            --arg model "openai/gpt-4o-mini" \
+            --arg prompt "$PROMPT" \
+            '{
+              model: $model,
+              messages: [
+                { role: "user", content: $prompt }
+              ]
+            }')
+
+          # Call GitHub Models API
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/ai_response.json \
+            "https://models.github.ai/inference/chat/completions" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "GitHub Models API returned HTTP $HTTP_CODE"
+            cat /tmp/ai_response.json
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract the AI's response content
+          AI_OUTPUT=$(jq -r '.choices[0].message.content // empty' /tmp/ai_response.json)
+
+          if [ -z "$AI_OUTPUT" ]; then
+            echo "AI response was empty"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "$AI_OUTPUT" > /tmp/ai_output.txt
+          echo "status=success" >> $GITHUB_OUTPUT
+
       - name: Handle Failure
         if: steps.rebase.outputs.status == 'failed'
         env:
