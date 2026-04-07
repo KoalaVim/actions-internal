@@ -70,8 +70,9 @@ jobs:
       - name: Extract Fork Changes
         id: extract
         if: steps.rebase.outputs.status == 'failed'
+        env:
+          UPSTREAM_BR: ${{ steps.setup.outputs.upstream_branch }}
         run: |
-          UPSTREAM_BR=${{ steps.setup.outputs.upstream_branch }}
           MERGE_BASE=$(git merge-base HEAD upstream/$UPSTREAM_BR)
 
           # Capture fork's diff and commit log
@@ -85,6 +86,7 @@ jobs:
           # Collect current upstream versions of affected files
           mkdir -p /tmp/upstream_files
           while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
             dir=$(dirname "$file")
             mkdir -p "/tmp/upstream_files/$dir"
             git show "upstream/$UPSTREAM_BR:$file" > "/tmp/upstream_files/$file" 2>/dev/null || true
