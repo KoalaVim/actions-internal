@@ -63,8 +63,34 @@ jobs:
             echo "status=success" >> $GITHUB_OUTPUT
             echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           else
+            git rebase --abort
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
+
+      - name: Extract Fork Changes
+        id: extract
+        if: steps.rebase.outputs.status == 'failed'
+        run: |
+          UPSTREAM_BR=${{ steps.setup.outputs.upstream_branch }}
+          MERGE_BASE=$(git merge-base HEAD upstream/$UPSTREAM_BR)
+
+          # Capture fork's diff and commit log
+          git diff "$MERGE_BASE"..HEAD > /tmp/fork.diff
+          git log --oneline "$MERGE_BASE"..HEAD > /tmp/fork_log.txt
+
+          # Collect affected file names
+          AFFECTED_FILES=$(git diff --name-only "$MERGE_BASE"..HEAD)
+          echo "$AFFECTED_FILES" > /tmp/affected_files.txt
+
+          # Collect current upstream versions of affected files
+          mkdir -p /tmp/upstream_files
+          while IFS= read -r file; do
+            dir=$(dirname "$file")
+            mkdir -p "/tmp/upstream_files/$dir"
+            git show "upstream/$UPSTREAM_BR:$file" > "/tmp/upstream_files/$file" 2>/dev/null || true
+          done <<< "$AFFECTED_FILES"
+
+          echo "merge_base=$MERGE_BASE" >> $GITHUB_OUTPUT
 
       - name: Handle Failure
         if: steps.rebase.outputs.status == 'failed'
