@@ -11,7 +11,7 @@ NC='\033[0m'
 # --- Defaults ---
 ORG_NAME="KoalaVim"
 ACTIONS_REPO="KoalaVim/actions-internal"
-TRACKING_ISSUE="1"
+TRACKING_ISSUE="93" # https://github.com/KoalaVim/KoalaVim/issues/93
 PROTOCOL="ssh"
 SSH_ALIAS="github.com"
 ACTIONS_BRANCH="master"
