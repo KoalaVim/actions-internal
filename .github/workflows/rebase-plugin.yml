@@ -106,45 +106,42 @@ jobs:
             exit 0
           fi
 
-          # Build upstream file content block
-          UPSTREAM_CONTENT=""
+          # Write prompt to file (avoids shell interpolation of untrusted content)
+          cat > /tmp/prompt_instructions.txt << 'PROMPT_EOF'
+          You are re-implementing changes from a forked repository onto the current upstream code.
+
+          Here are the changes the fork made (as a unified diff):
+          ```diff
+          PROMPT_EOF
+          cat /tmp/fork.diff >> /tmp/prompt_instructions.txt
+          cat >> /tmp/prompt_instructions.txt << 'PROMPT_EOF'
+          ```
+
+          Here are the current upstream versions of the affected files:
+          PROMPT_EOF
+
+          # Append upstream file contents directly to prompt file
           while IFS= read -r file; do
             if [ -f "/tmp/upstream_files/$file" ]; then
-              CONTENT=$(cat "/tmp/upstream_files/$file")
-              UPSTREAM_CONTENT="${UPSTREAM_CONTENT}
---- FILE: ${file} ---
-${CONTENT}
---- END FILE ---"
+              printf '=== FILE: %s ===\n' "$file" >> /tmp/prompt_instructions.txt
+              cat "/tmp/upstream_files/$file" >> /tmp/prompt_instructions.txt
+              printf '\n=== END FILE ===\n' >> /tmp/prompt_instructions.txt
             fi
           done < /tmp/affected_files.txt
 
-          # Write prompt instructions to file (avoids shell interpolation of untrusted content)
-          cat > /tmp/prompt_instructions.txt << 'PROMPT_EOF'
-You are re-implementing changes from a forked repository onto the current upstream code.
-
-Here are the changes the fork made (as a unified diff):
-```diff
-PROMPT_EOF
-          cat /tmp/fork.diff >> /tmp/prompt_instructions.txt
-          cat >> /tmp/prompt_instructions.txt << 'PROMPT_EOF'
-```
-
-Here are the current upstream versions of the affected files:
-PROMPT_EOF
-          printf '%s\n' "$UPSTREAM_CONTENT" >> /tmp/prompt_instructions.txt
           cat >> /tmp/prompt_instructions.txt << 'PROMPT_EOF'
 
-Re-implement the fork's changes on top of the current upstream code. Preserve the intent of every change in the diff.
+          Re-implement the fork's changes on top of the current upstream code. Preserve the intent of every change in the diff.
 
-Output ONLY the modified files in this exact format (no other text):
+          Output ONLY the modified files in this exact format (no other text):
 
---- FILE: path/to/file ---
-<full file content here>
---- END FILE ---
-PROMPT_EOF
+          === FILE: path/to/file ===
+          <full file content here>
+          === END FILE ===
+          PROMPT_EOF
 
           # Build JSON payload safely using jq --rawfile
-          PAYLOAD=$(jq -n \
+          jq -n \
             --rawfile prompt /tmp/prompt_instructions.txt \
             --arg model "openai/gpt-4o-mini" \
             '{
@@ -152,14 +149,14 @@ PROMPT_EOF
               messages: [
                 { role: "user", content: $prompt }
               ]
-            }')
+            }' > /tmp/payload.json
 
           # Call GitHub Models API
           HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/ai_response.json \
             "https://models.github.ai/inference/chat/completions" \
             -H "Authorization: Bearer $GH_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "$PAYLOAD")
+            -d @/tmp/payload.json)
 
           if [ "$HTTP_CODE" -ne 200 ]; then
             echo "GitHub Models API returned HTTP $HTTP_CODE"
@@ -202,15 +199,15 @@ PROMPT_EOF
           CURRENT_CONTENT=""
 
           while IFS= read -r line; do
-            if echo "$line" | grep -qE '^--- FILE: .+ ---$'; then
+            if echo "$line" | grep -qE '^=== FILE: .+ ===$'; then
               # If we were accumulating a file, write it
               if [ -n "$CURRENT_FILE" ]; then
                 mkdir -p "$(dirname "$CURRENT_FILE")"
                 printf '%s\n' "$CURRENT_CONTENT" > "$CURRENT_FILE"
               fi
-              CURRENT_FILE=$(echo "$line" | sed 's/^--- FILE: //;s/ ---$//')
+              CURRENT_FILE=$(echo "$line" | sed 's/^=== FILE: //;s/ ===$//')
               CURRENT_CONTENT=""
-            elif echo "$line" | grep -qE '^--- END FILE ---$'; then
+            elif echo "$line" | grep -qE '^=== END FILE ===$'; then
               if [ -n "$CURRENT_FILE" ]; then
                 mkdir -p "$(dirname "$CURRENT_FILE")"
                 printf '%s\n' "$CURRENT_CONTENT" > "$CURRENT_FILE"
@@ -222,8 +219,7 @@ PROMPT_EOF
                 if [ -z "$CURRENT_CONTENT" ]; then
                   CURRENT_CONTENT="$line"
                 else
-                  CURRENT_CONTENT="${CURRENT_CONTENT}
-$line"
+                  printf -v CURRENT_CONTENT '%s\n%s' "$CURRENT_CONTENT" "$line"
                 fi
               fi
             fi
@@ -249,21 +245,21 @@ $line"
 
           git push origin "$BRANCH_NAME"
 
-          cat > /tmp/pr_body.md << EOF
-Automated AI re-implementation of fork changes onto upstream.
-
-**Original fork commits:**
-\`\`\`
-${FORK_LOG}
-\`\`\`
-
-**Files modified by AI:**
-\`\`\`
-${AFFECTED_FILES}
-\`\`\`
-
-> This PR was generated by AI and requires human review.
-EOF
+          {
+            echo "Automated AI re-implementation of fork changes onto upstream."
+            echo ""
+            echo "**Original fork commits:**"
+            echo '```'
+            cat /tmp/fork_log.txt
+            echo '```'
+            echo ""
+            echo "**Files modified by AI:**"
+            echo '```'
+            cat /tmp/affected_files.txt
+            echo '```'
+            echo ""
+            echo "> This PR was generated by AI and requires human review."
+          } > /tmp/pr_body.md
 
           gh pr create \
             --repo "$REPO" \
