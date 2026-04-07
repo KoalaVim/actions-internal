@@ -71,10 +71,14 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
-          # 1. Create issue in the fork
-          gh issue create --title "Rebase Conflict" --body "Rebase with ${{ inputs.upstream_repo }} failed."
+          # 1. Create issue ONLY in the local fork
+          # ${{ github.repository }} evaluates to "KoalaVim/guess-indent.nvim"
+          gh issue create \
+            --repo ${{ github.repository }} \
+            --title "Rebase Conflict: ${{ inputs.plugin_name }}" \
+            --body "The automatic rebase with ${{ inputs.upstream_repo }} failed. Please resolve conflicts manually in this fork."
 
-          # 2. Comment on the Dashboard in the main repo
+          # 2. Comment on the Dashboard in the main KoalaVim repo
           gh issue comment ${{ inputs.tracking_issue_number }} \
             --repo ${{ github.repository_owner }}/KoalaVim \
             --body "🚨 **Conflict:** [${{ inputs.plugin_name }}](${{ github.server_url }}/${{ github.repository }}) needs manual attention."
