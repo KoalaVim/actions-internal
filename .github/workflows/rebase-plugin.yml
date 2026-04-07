@@ -98,7 +98,7 @@ jobs:
         id: ai_resolve
         if: steps.rebase.outputs.status == 'failed'
         env:
-          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ ! -f /tmp/affected_files.txt ]; then
             echo "No affected files data found; extract step may have failed"
