@@ -26,7 +26,9 @@ jobs:
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.KOALA_APP_ID }}
-          private_key: ${{ secrets.KOALA_APP_PRIVATE_KEY }}
+          private-key: ${{ secrets.KOALA_APP_PRIVATE_KEY }}
+          # This ensures the token works across the whole Org
+          owner: ${{ github.repository_owner }}
 
       - name: Checkout Fork
         uses: actions/checkout@v4
@@ -34,53 +36,66 @@ jobs:
           token: ${{ steps.generate_token.outputs.token }}
           fetch-depth: 0
 
-      - name: Setup Bot Identity
+      - name: Setup Bot Identity & Upstream
+        id: setup
         run: |
-          # Use the official bot email for clean history
           git config --global user.name "koalavim-bot[bot]"
-          git config --global user.email "${{ steps.generate_token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git config --global user.email "koalavimbot[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/${{ inputs.upstream_repo }}.git
           git fetch upstream
+
+          # Detect upstream default branch (main vs master)
+          UPSTREAM_DEFAULT=$(git remote show upstream | sed -n '/HEAD branch/s/.*: //p')
+          echo "upstream_branch=$UPSTREAM_DEFAULT" >> $GITHUB_OUTPUT
+
+          # Detect local default branch
+          LOCAL_DEFAULT=$(git symbolic-ref --short HEAD)
+          echo "local_branch=$LOCAL_DEFAULT" >> $GITHUB_OUTPUT
 
       - name: Attempt Rebase
         id: rebase
         run: |
-          if git rebase upstream/master; then
-            git push origin master --force
+          UPSTREAM_BR=${{ steps.setup.outputs.upstream_branch }}
+          LOCAL_BR=${{ steps.setup.outputs.local_branch }}
+
+          if git rebase upstream/$UPSTREAM_BR; then
+            git push origin $LOCAL_BR --force
             echo "status=success" >> $GITHUB_OUTPUT
             echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           else
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
 
-      - name: Handle Failure (Issue in Fork + Dashboard Comment)
+      - name: Handle Failure
         if: steps.rebase.outputs.status == 'failed'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
-          gh issue create --title "Rebase Conflict" --body "Please resolve manually."
-          gh issue comment ${{ inputs.tracking_issue_number }} \
-            --repo KoalaVim/KoalaVim \
-            --body "🚨 **Conflict:** ${{ inputs.plugin_name }} needs manual attention."
+          # 1. Create issue in the fork
+          gh issue create --title "Rebase Conflict" --body "Rebase with ${{ inputs.upstream_repo }} failed."
 
-      - name: Update KoalaVim Lockfile (Success Path)
+          # 2. Comment on the Dashboard in the main repo
+          gh issue comment ${{ inputs.tracking_issue_number }} \
+            --repo ${{ github.repository_owner }}/KoalaVim \
+            --body "🚨 **Conflict:** [${{ inputs.plugin_name }}](${{ github.server_url }}/${{ github.repository }}) needs manual attention."
+
+      - name: Update KoalaVim Lockfile
         if: steps.rebase.outputs.status == 'success'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
           NEW_SHA=${{ steps.rebase.outputs.sha }}
-          git clone https://x-access-token:$GH_TOKEN@github.com/KoalaVim/KoalaVim.git main_repo
+          git clone https://x-access-token:$GH_TOKEN@github.com/${{ github.repository_owner }}/KoalaVim.git main_repo
           cd main_repo
 
-          BRANCH="update-${{ inputs.plugin_name }}-${NEW_SHA:0:7}"
-          git checkout -b $BRANCH
+          BRANCH_NAME="update-${{ inputs.plugin_name }}-${NEW_SHA:0:7}"
+          git checkout -b $BRANCH_NAME
 
-          # Update lazy-lock.json (handles nested keys correctly)
           jq --arg p "${{ inputs.plugin_name }}" --arg s "$NEW_SHA" \
              '.[$p].commit = $s' lazy-lock.json > tmp.json && mv tmp.json lazy-lock.json
 
           git add lazy-lock.json
           git commit -m "chore(deps): update ${{ inputs.plugin_name }} to ${NEW_SHA:0:7}"
-          git push origin $BRANCH
+          git push origin $BRANCH_NAME
 
-          gh pr create --title "Update ${{ inputs.plugin_name }}" --body "Automated sync." --base master --head $BRANCH
+          gh pr create --title "Update ${{ inputs.plugin_name }}" --body "Automated sync." --base master --head $BRANCH_NAME
