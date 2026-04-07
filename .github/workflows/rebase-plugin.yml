@@ -1,0 +1,86 @@
+name: Rebase Plugin Fork
+on:
+  workflow_call:
+    inputs:
+      upstream_repo:
+        required: true
+        type: string
+      plugin_name:
+        required: true
+        type: string
+      tracking_issue_number:
+        required: true
+        type: string
+    secrets:
+      KOALA_APP_ID:
+        required: true
+      KOALA_APP_PRIVATE_KEY:
+        required: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Token
+        id: generate_token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.KOALA_APP_ID }}
+          private_key: ${{ secrets.KOALA_APP_PRIVATE_KEY }}
+
+      - name: Checkout Fork
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
+
+      - name: Setup Bot Identity
+        run: |
+          # Use the official bot email for clean history
+          git config --global user.name "koalavim-bot[bot]"
+          git config --global user.email "${{ steps.generate_token.outputs.app-slug }}[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/${{ inputs.upstream_repo }}.git
+          git fetch upstream
+
+      - name: Attempt Rebase
+        id: rebase
+        run: |
+          if git rebase upstream/master; then
+            git push origin master --force
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Handle Failure (Issue in Fork + Dashboard Comment)
+        if: steps.rebase.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          gh issue create --title "Rebase Conflict" --body "Please resolve manually."
+          gh issue comment ${{ inputs.tracking_issue_number }} \
+            --repo KoalaVim/KoalaVim \
+            --body "🚨 **Conflict:** ${{ inputs.plugin_name }} needs manual attention."
+
+      - name: Update KoalaVim Lockfile (Success Path)
+        if: steps.rebase.outputs.status == 'success'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        run: |
+          NEW_SHA=${{ steps.rebase.outputs.sha }}
+          git clone https://x-access-token:$GH_TOKEN@github.com/KoalaVim/KoalaVim.git main_repo
+          cd main_repo
+
+          BRANCH="update-${{ inputs.plugin_name }}-${NEW_SHA:0:7}"
+          git checkout -b $BRANCH
+
+          # Update lazy-lock.json (handles nested keys correctly)
+          jq --arg p "${{ inputs.plugin_name }}" --arg s "$NEW_SHA" \
+             '.[$p].commit = $s' lazy-lock.json > tmp.json && mv tmp.json lazy-lock.json
+
+          git add lazy-lock.json
+          git commit -m "chore(deps): update ${{ inputs.plugin_name }} to ${NEW_SHA:0:7}"
+          git push origin $BRANCH
+
+          gh pr create --title "Update ${{ inputs.plugin_name }}" --body "Automated sync." --base master --head $BRANCH
