@@ -98,7 +98,7 @@ jobs:
           sed -i "s/\(\"${{ inputs.plugin_name }}\".*\"commit\": \"\)[^\"]*/\1$NEW_SHA/" lazy-lock.json
 
           git add lazy-lock.json
-          git commit -m "chore(deps): update ${{ inputs.plugin_name }} to ${NEW_SHA:0:7}"
+          git commit -m "chore(deps): update ${{ inputs.plugin_name }}"
           git push origin $BRANCH_NAME
 
-          gh pr create --title "Update ${{ inputs.plugin_name }}" --body "Automated sync." --base master --head $BRANCH_NAME
+          gh pr create --title "chore(deps): update ${{ inputs.plugin_name }}" --body "Automated sync." --base master --head $BRANCH_NAME
