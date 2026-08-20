@@ -95,6 +95,8 @@ jobs:
           BRANCH_NAME="update-${{ inputs.plugin_name }}-${NEW_SHA:0:7}"
           git checkout -b $BRANCH_NAME
 
+          LOCAL_BR=${{ steps.setup.outputs.local_branch }}
+          sed -i "s/\(\"${{ inputs.plugin_name }}\".*\"branch\": \"\)[^\"]*/\1$LOCAL_BR/" lazy-lock.json
           sed -i "s/\(\"${{ inputs.plugin_name }}\".*\"commit\": \"\)[^\"]*/\1$NEW_SHA/" lazy-lock.json
 
           git add lazy-lock.json
