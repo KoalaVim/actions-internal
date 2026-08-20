@@ -107,14 +107,67 @@ git commit -m "chore: add auto-sync workflow" --quiet
 git remote set-url origin "$DEST_URL"
 echo -e "📤 ${BLUE}Pushing branch '$BRANCH' via ${PROTOCOL}...${NC}"
 
-if git push -u origin "$BRANCH" --quiet; then
-    cd ..
-    rm -rf "$TEMP_DIR"
-    echo -e "${CYAN}------------------------------------------------------------${NC}"
-    echo -e "${GREEN}✅ SUCCESS!${NC}"
-    echo -e "${GREEN}🔗 Repo:${NC} https://github.com/$ORG_NAME/$REPO_NAME"
-    echo -e "${CYAN}------------------------------------------------------------${NC}"
-else
+if ! git push -u origin "$BRANCH" --quiet; then
     echo -e "${RED}❌ Push failed!${NC}"
     exit 1
 fi
+
+NEW_SHA=$(git rev-parse HEAD)
+SOURCE_OWNER=$(echo "$SOURCE_REPO" | cut -d'/' -f1)
+cd ..
+
+# 7. Update KoalaVim repo: Lua plugin references + lockfile
+echo -e "📝 ${BLUE}Updating $ORG_NAME/$ORG_NAME references...${NC}"
+MAIN_REPO_DIR="${ORG_NAME}-main-update"
+rm -rf "$MAIN_REPO_DIR"
+
+if [ "$PROTOCOL" == "ssh" ]; then
+    git clone --quiet "git@$SSH_ALIAS:$ORG_NAME/$ORG_NAME.git" "$MAIN_REPO_DIR"
+else
+    git clone --quiet "https://github.com/$ORG_NAME/$ORG_NAME.git" "$MAIN_REPO_DIR"
+fi
+cd "$MAIN_REPO_DIR" || exit
+
+PR_BRANCH="migrate-${REPO_NAME}-to-${ORG_NAME}"
+git checkout -b "$PR_BRANCH"
+
+# Update Lua files: replace old owner with org name
+CHANGED=0
+grep -rl "$SOURCE_REPO" --include='*.lua' . | while read -r file; do
+    sed -i '' "s|$SOURCE_REPO|$ORG_NAME/$REPO_NAME|g" "$file"
+done
+
+# Update lazy-lock.json: branch + commit SHA
+if [ -f lazy-lock.json ]; then
+    sed -i '' "s/\(\"$REPO_NAME\".*\"branch\": \"\)[^\"]*/\1$BRANCH/" lazy-lock.json
+    sed -i '' "s/\(\"$REPO_NAME\".*\"commit\": \"\)[^\"]*/\1$NEW_SHA/" lazy-lock.json
+fi
+
+git add -A
+if git diff --cached --quiet; then
+    echo -e "   ${YELLOW}ℹ${NC} No changes needed in $ORG_NAME/$ORG_NAME"
+    cd ..
+    rm -rf "$MAIN_REPO_DIR"
+else
+    git commit -m "chore(deps): migrate $REPO_NAME from $SOURCE_OWNER to $ORG_NAME" --quiet
+    git push -u origin "$PR_BRANCH" --quiet
+    PR_URL=$(gh pr create \
+        --repo "$ORG_NAME/$ORG_NAME" \
+        --title "chore(deps): migrate $REPO_NAME to $ORG_NAME" \
+        --body "Migrated fork from \`$SOURCE_REPO\` to \`$ORG_NAME/$REPO_NAME\`.
+
+Updates:
+- Lua plugin references: \`$SOURCE_REPO\` → \`$ORG_NAME/$REPO_NAME\`
+- \`lazy-lock.json\`: branch → \`$BRANCH\`, commit → \`${NEW_SHA:0:7}\`" \
+        --base master \
+        --head "$PR_BRANCH" 2>&1)
+    echo -e "   ${GREEN}✓${NC} PR: $PR_URL"
+    cd ..
+    rm -rf "$MAIN_REPO_DIR"
+fi
+
+rm -rf "$TEMP_DIR"
+echo -e "${CYAN}------------------------------------------------------------${NC}"
+echo -e "${GREEN}✅ SUCCESS!${NC}"
+echo -e "${GREEN}🔗 Repo:${NC} https://github.com/$ORG_NAME/$REPO_NAME"
+echo -e "${CYAN}------------------------------------------------------------${NC}"
