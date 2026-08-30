@@ -63,11 +63,213 @@ jobs:
             echo "status=success" >> $GITHUB_OUTPUT
             echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
           else
+            git rebase --abort
             echo "status=failed" >> $GITHUB_OUTPUT
           fi
 
-      - name: Handle Failure
+      - name: Extract Fork Changes
+        id: extract
         if: steps.rebase.outputs.status == 'failed'
+        env:
+          UPSTREAM_BR: ${{ steps.setup.outputs.upstream_branch }}
+        run: |
+          MERGE_BASE=$(git merge-base HEAD upstream/$UPSTREAM_BR)
+
+          # Capture fork's diff and commit log
+          git diff "$MERGE_BASE"..HEAD > /tmp/fork.diff
+          git log --oneline "$MERGE_BASE"..HEAD > /tmp/fork_log.txt
+
+          # Collect affected file names
+          AFFECTED_FILES=$(git diff --name-only "$MERGE_BASE"..HEAD)
+          echo "$AFFECTED_FILES" > /tmp/affected_files.txt
+
+          # Collect current upstream versions of affected files
+          mkdir -p /tmp/upstream_files
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            dir=$(dirname "$file")
+            mkdir -p "/tmp/upstream_files/$dir"
+            git show "upstream/$UPSTREAM_BR:$file" > "/tmp/upstream_files/$file" 2>/dev/null || true
+          done <<< "$AFFECTED_FILES"
+
+          echo "merge_base=$MERGE_BASE" >> $GITHUB_OUTPUT
+
+      - name: AI Re-implementation
+        id: ai_resolve
+        if: steps.rebase.outputs.status == 'failed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f /tmp/affected_files.txt ]; then
+            echo "No affected files data found; extract step may have failed"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Write prompt to file (avoids shell interpolation of untrusted content)
+          cat > /tmp/prompt_instructions.txt << 'PROMPT_EOF'
+          You are re-implementing changes from a forked repository onto the current upstream code.
+
+          Here are the changes the fork made (as a unified diff):
+          ```diff
+          PROMPT_EOF
+          cat /tmp/fork.diff >> /tmp/prompt_instructions.txt
+          cat >> /tmp/prompt_instructions.txt << 'PROMPT_EOF'
+          ```
+
+          Here are the current upstream versions of the affected files:
+          PROMPT_EOF
+
+          # Append upstream file contents directly to prompt file
+          while IFS= read -r file; do
+            if [ -f "/tmp/upstream_files/$file" ]; then
+              printf '=== FILE: %s ===\n' "$file" >> /tmp/prompt_instructions.txt
+              cat "/tmp/upstream_files/$file" >> /tmp/prompt_instructions.txt
+              printf '\n=== END FILE ===\n' >> /tmp/prompt_instructions.txt
+            fi
+          done < /tmp/affected_files.txt
+
+          cat >> /tmp/prompt_instructions.txt << 'PROMPT_EOF'
+
+          Re-implement the fork's changes on top of the current upstream code. Preserve the intent of every change in the diff.
+
+          Output ONLY the modified files in this exact format (no other text):
+
+          === FILE: path/to/file ===
+          <full file content here>
+          === END FILE ===
+          PROMPT_EOF
+
+          # Build JSON payload safely using jq --rawfile
+          jq -n \
+            --rawfile prompt /tmp/prompt_instructions.txt \
+            --arg model "openai/gpt-4o-mini" \
+            '{
+              model: $model,
+              messages: [
+                { role: "user", content: $prompt }
+              ]
+            }' > /tmp/payload.json
+
+          # Call GitHub Models API
+          HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/ai_response.json \
+            "https://models.github.ai/inference/chat/completions" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d @/tmp/payload.json)
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "GitHub Models API returned HTTP $HTTP_CODE"
+            cat /tmp/ai_response.json
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Extract the AI's response content
+          AI_OUTPUT=$(jq -r '.choices[0].message.content // empty' /tmp/ai_response.json)
+
+          if [ -z "$AI_OUTPUT" ]; then
+            echo "AI response was empty"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "$AI_OUTPUT" > /tmp/ai_output.txt
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Apply AI Resolution
+        id: ai_pr
+        if: steps.rebase.outputs.status == 'failed' && steps.ai_resolve.outputs.status == 'success'
+        env:
+          GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+          UPSTREAM_BR: ${{ steps.setup.outputs.upstream_branch }}
+          LOCAL_BR: ${{ steps.setup.outputs.local_branch }}
+          PLUGIN_NAME: ${{ inputs.plugin_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          UPSTREAM_SHA=$(git rev-parse upstream/$UPSTREAM_BR)
+          BRANCH_NAME="ai-rebase-${PLUGIN_NAME}-${UPSTREAM_SHA:0:7}"
+
+          # Create new branch from upstream
+          git checkout -b "$BRANCH_NAME" "upstream/$UPSTREAM_BR"
+
+          # Parse AI output and write files
+          AI_OUTPUT=$(cat /tmp/ai_output.txt)
+          CURRENT_FILE=""
+          CURRENT_CONTENT=""
+
+          while IFS= read -r line; do
+            if echo "$line" | grep -qE '^=== FILE: .+ ===$'; then
+              # If we were accumulating a file, write it
+              if [ -n "$CURRENT_FILE" ]; then
+                mkdir -p "$(dirname "$CURRENT_FILE")"
+                printf '%s\n' "$CURRENT_CONTENT" > "$CURRENT_FILE"
+              fi
+              CURRENT_FILE=$(echo "$line" | sed 's/^=== FILE: //;s/ ===$//')
+              CURRENT_CONTENT=""
+            elif echo "$line" | grep -qE '^=== END FILE ===$'; then
+              if [ -n "$CURRENT_FILE" ]; then
+                mkdir -p "$(dirname "$CURRENT_FILE")"
+                printf '%s\n' "$CURRENT_CONTENT" > "$CURRENT_FILE"
+              fi
+              CURRENT_FILE=""
+              CURRENT_CONTENT=""
+            else
+              if [ -n "$CURRENT_FILE" ]; then
+                if [ -z "$CURRENT_CONTENT" ]; then
+                  CURRENT_CONTENT="$line"
+                else
+                  printf -v CURRENT_CONTENT '%s\n%s' "$CURRENT_CONTENT" "$line"
+                fi
+              fi
+            fi
+          done <<< "$AI_OUTPUT"
+
+          # Write last file if no END marker
+          if [ -n "$CURRENT_FILE" ]; then
+            mkdir -p "$(dirname "$CURRENT_FILE")"
+            printf '%s\n' "$CURRENT_CONTENT" > "$CURRENT_FILE"
+          fi
+
+          AFFECTED_FILES=$(cat /tmp/affected_files.txt)
+          FORK_LOG=$(cat /tmp/fork_log.txt)
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "AI produced no file changes; skipping PR creation"
+            echo "status=failed" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git add -A
+          git commit -m "chore(ai-rebase): re-implement fork changes for ${PLUGIN_NAME}"
+
+          git push origin "$BRANCH_NAME"
+
+          {
+            echo "Automated AI re-implementation of fork changes onto upstream."
+            echo ""
+            echo "**Original fork commits:**"
+            echo '```'
+            cat /tmp/fork_log.txt
+            echo '```'
+            echo ""
+            echo "**Files modified by AI:**"
+            echo '```'
+            cat /tmp/affected_files.txt
+            echo '```'
+            echo ""
+            echo "> This PR was generated by AI and requires human review."
+          } > /tmp/pr_body.md
+
+          gh pr create \
+            --repo "$REPO" \
+            --title "AI Rebase: ${PLUGIN_NAME}" \
+            --base "$LOCAL_BR" \
+            --head "$BRANCH_NAME" \
+            --body-file /tmp/pr_body.md
+
+      - name: Handle Failure
+        if: steps.rebase.outputs.status == 'failed' && steps.ai_resolve.outputs.status != 'success'
         env:
           GH_TOKEN: ${{ steps.generate_token.outputs.token }}
         run: |
